@@ -41,9 +41,9 @@ RUN set -x \
 
 FROM debian:bullseye-slim
 
-ARG ENTRYPOINT_PATH=./docker-entrypoint.sh
-ARG INSTALL_BROTLI=./install-brotli.sh
-ARG CHECK_STANDALONE_CONFIG=./check_standalone_config.sh
+ARG ENTRYPOINT_PATH=./docker/debian-dev/docker-entrypoint.sh
+ARG INSTALL_BROTLI=./docker/debian-dev/install-brotli.sh
+ARG CHECK_STANDALONE_CONFIG=./docker/utils/check_standalone_config.sh
 
 # Install the runtime libyaml package
 RUN apt-get -y update --fix-missing \

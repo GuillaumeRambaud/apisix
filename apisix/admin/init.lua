@@ -61,6 +61,7 @@ local resources = {
     plugin_configs  = require("apisix.admin.plugin_config"),
     consumer_groups = require("apisix.admin.consumer_group"),
     secrets         = require("apisix.admin.secrets"),
+    export = require("apisix.admin.export"),
 }
 
 
@@ -161,6 +162,7 @@ end
 
 
 local function run()
+    core.log.info("INIT RUN Method ", get_method(), " URI ", ngx.var.uri)
     set_ctx_and_check_token()
 
     local uri_segs = core.utils.split_uri(ngx.var.uri)
@@ -458,6 +460,11 @@ local uri_route = {
         methods = { "GET", "POST", "DELETE", "PATCH" },
         handler = unsupported_methods_reload_plugin,
     },
+     {
+        paths = [[/apisix/admin/export]],
+        methods = {"GET"},
+        handler = resources.export.export_yaml_handler,
+     }
 }
 
 
