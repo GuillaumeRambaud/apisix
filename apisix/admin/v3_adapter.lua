@@ -245,5 +245,39 @@ function _M.filter(body, resource)
     return processed_body
 end
 
+function _M.filterWOPagination(body, resource)
+    if not enable_v3() then
+        return body
+    end
+
+    local args = request.get_uri_args()
+    local processed_body = deepcopy(body)
+
+    if processed_body.deleted then
+        processed_body.node = nil
+    end
+
+    -- strip node wrapping for single query, create, and update scenarios.
+    if processed_body.node then
+        processed_body = processed_body.node
+    end
+
+    -- filter and paging logic for list query only
+    if processed_body.list then
+        filter(processed_body, args, resource)
+
+        -- calculate the total amount of filtered data
+        processed_body.total = processed_body.list and #processed_body.list or 0
+
+        pagination(processed_body, args)
+
+        -- remove the count field returned by etcd
+        -- we don't need a field that reflects the length of the currently returned data,
+        -- it doesn't make sense
+        processed_body.count = nil
+    end
+
+    return processed_body
+end
 
 return _M

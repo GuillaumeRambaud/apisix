@@ -8,7 +8,7 @@ local _M = {}
 
 --- Utility to fetch all keys under a prefix
 local function fetch_all(prefix)
-    local ok, res = core.etcd:get(prefix, { prefix = true })
+    local ok, res = core.etcd.get(prefix, { prefix = true })
     if not ok then
         return nil, "failed to get " .. prefix
     end
@@ -16,39 +16,30 @@ local function fetch_all(prefix)
 end
 
 function _M.export_yaml_handler()
-    _M.set_ctx_and_check_token()
-
     -- Gather data
-    local routes, err = fetch_all("/apisix/admin/routes")
+    local routes, err = fetch_all("/routes")
     if not routes then
         core.log.error("export: get routes failed: ", err)
         return core.response.exit(500, { error = "failed to fetch routes" })
     end
     core.log.info("export: fetched ", routes)
 
-    local services, err2 = fetch_all("/apisix/admin/services")
+    local services, err2 = fetch_all("/services")
     if not services then
         core.log.error("export: get services failed: ", err2)
         return core.response.exit(500, { error = "failed to fetch services" })
     end
 
-    local upstreams, err3 = fetch_all("/apisix/admin/upstreams")
+    local upstreams, err3 = fetch_all("/upstreams")
     if not upstreams then
         core.log.error("export: get upstreams failed: ", err3)
         return core.response.exit(500, { error = "failed to fetch upstreams" })
     end
 
-    local consumers, err4 = fetch_all("/apisix/admin/consumers")
+    local consumers, err4 = fetch_all("/consumers")
     if not consumers then
         core.log.error("export: get consumers failed: ", err4)
         return core.response.exit(500, { error = "failed to fetch consumers" })
-    end
-
-    local plugin_meta, err5 = fetch_all("/apisix/admin/plugin_metadata")
-    if not plugin_meta then
-        -- optional, you might ignore this or log
-        core.log.warn("export: plugin_metadata not found: ", err5)
-        plugin_meta = {}
     end
 
     -- Build export table

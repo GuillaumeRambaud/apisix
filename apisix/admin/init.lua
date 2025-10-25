@@ -22,6 +22,8 @@ local plugin = require("apisix.plugin")
 local standalone = require("apisix.admin.standalone")
 local v3_adapter = require("apisix.admin.v3_adapter")
 local utils = require("apisix.admin.utils")
+local lyaml         = require("lyaml")
+local cjson = require("cjson.safe")
 local ngx = ngx
 local get_method = ngx.req.get_method
 local ngx_time = ngx.time
@@ -34,11 +36,13 @@ local reload_event = "/apisix/admin/plugins/reload"
 local ipairs = ipairs
 local error = error
 local type = type
+local ngx_exit = ngx.exit
 
 
 local events
-local MAX_REQ_BODY = 1024 * 1024 * 1.5      -- 1.5 MiB
+local MAX_REQ_BODY = 1024 * 1024 * 50      -- 50 MiB
 
+local LAST_IMPORT_KEY = "/admin/import/last"
 
 local viewer_methods = {
     get = true,
@@ -61,7 +65,7 @@ local resources = {
     plugin_configs  = require("apisix.admin.plugin_config"),
     consumer_groups = require("apisix.admin.consumer_group"),
     secrets         = require("apisix.admin.secrets"),
-    export = require("apisix.admin.export"),
+    export          = require("apisix.admin.export"),
 }
 
 
@@ -160,13 +164,277 @@ local function head()
     core.response.exit(200)
 end
 
+local function to_yaml_clean(data)
+    local yaml = lyaml.dump({ data })
+
+    -- remove YAML start and end markers
+    yaml = yaml:gsub("^[%-]+%s*\r?\n", "")     -- remove any leading --- and whitespace/newlines
+    yaml = yaml:gsub("\r?\n%.%.%.%s*$", "") 
+
+    return yaml
+end
+
+local function get_resource_data(seg_res)
+    local method = "get"
+
+    local resource = resources[seg_res]
+    if not resource then
+        core.log.error("Unsupported resource type: ", seg_res)
+        return nil, "Unsupported resource type: " .. seg_res
+    end
+
+    if not resource[method] then
+        core.log.error("No GET method for resource: ", seg_res)
+        return nil, "GET not supported for resource: " .. seg_res
+    end
+
+    -- No request body for GET
+    local seg_id = nil
+    local req_body = nil
+    local seg_sub_path = nil
+    local uri_args = ngx.req.get_uri_args() or {}
+
+    -- Call the underlying resource handler
+    local code, data = resource[method](resource, seg_id, req_body, seg_sub_path, uri_args)
+    if not code then
+        return nil, "Failed to fetch " .. seg_res
+    end
+
+    -- Decrypt sensitive fields if plugin encryption is active
+    if plugin and plugin.enable_data_encryption then
+        if seg_res == "consumers" or seg_res == "credentials" then
+            utils.decrypt_params(plugin.decrypt_conf, data, core.schema.TYPE_CONSUMER)
+        elseif seg_res == "plugin_metadata" then
+            utils.decrypt_params(plugin.decrypt_conf, data, core.schema.TYPE_METADATA)
+        else
+            utils.decrypt_params(plugin.decrypt_conf, data)
+        end
+    end
+
+    -- Normalize version header
+    if v3_adapter.enable_v3() then
+        core.response.set_header("X-API-VERSION", "v3")
+    else
+        core.response.set_header("X-API-VERSION", "v2")
+    end
+
+    data = v3_adapter.filterWOPagination(data, resource)
+    data = strip_etcd_resp(data)
+
+    return data
+end
+
+-- Get last import timestamp from etcd
+local function get_last_import_time()
+    local res, err = core.etcd.get(LAST_IMPORT_KEY)
+    if not res then
+        core.log.warn("No previous import timestamp found in etcd: ", err)
+        return nil
+    end
+
+    local decoded, decode_err = cjson.decode(res.body.node.value)
+    if not decoded or not decoded.last_import then
+        core.log.warn("Failed to decode last import timestamp: ", decode_err)
+        return nil
+    end
+
+    return decoded.last_import
+end
+
+-- Save last import timestamp in etcd
+local function save_last_import_time()
+    local now = os.date("!%Y-%m-%d %H:%M:%S")  -- UTC ISO format
+    local data = cjson.encode({ last_import = now })
+
+    local ok, err = core.etcd.set(LAST_IMPORT_KEY, data, nil)
+    if not ok then
+        core.log.error("Failed to save last import timestamp in etcd: ", err)
+    end
+end
+
+local function clear_existing_config()
+
+    local resources_to_clear = {
+        "routes",
+        "services",
+        "upstreams",
+        "consumers",
+    }
+
+    for _, res in ipairs(resources_to_clear) do
+        local resource = resources[res]
+        if not resource then
+            core.log.warn("Resource not found: ", res)
+        else
+            -- Fetch all current items
+            local code, data = resource.get(resource, nil, nil, nil, {})
+            if code == 200 and data and data.list then
+                for _, item in ipairs(data.list) do
+                    if item.value and item.value.id then
+                        local id = item.value.id
+                        -- ✅ Fix: pass nil,nil,nil,{} to satisfy the expected params
+                        local del_code = resource.delete(resource, id, nil, nil, {})
+                        if del_code == 200 then
+                            core.log.debug("Deleted ", res, " id=", id)
+                        else
+                            core.log.warn("Failed to delete ", res, " id=", id, " code=", del_code)
+                        end
+                    end
+                end
+            else
+                core.log.warn("Failed to fetch list for resource: ", res, " code=", code)
+            end
+        end
+    end
+end
+
+local function get_last_import_handler()
+    local last_import = get_last_import_time()
+    core.response.exit(200, {
+        last_import = last_import or "never"
+    })
+end
+
+local function run_import()
+    set_ctx_and_check_token()
+
+    -- Read the request body
+    local req_body, err = core.request.get_body(MAX_REQ_BODY)
+    if err then
+        core.log.error("failed to read request body: ", err)
+        core.response.exit(400, { error_msg = "invalid request body: " .. err })
+    end
+
+    if not req_body or #req_body == 0 then
+        core.response.exit(400, { error_msg = "empty request body" })
+    end
+
+    -- Parse YAML
+    local ok, obj = pcall(lyaml.load, req_body)
+    if not ok or not obj then
+        core.log.error("failed to parse YAML: ", obj)
+        core.response.exit(400, { error_msg = "failed to parse YAML: " .. (obj or "unknown") })
+    end
+
+    if type(obj) ~= "table" then
+        core.response.exit(400, { error_msg = "YAML root must be a mapping" })
+    end
+
+    -- Extract sections
+    local routes    = obj.routes or {}
+    local services  = obj.services or {}
+    local consumers = obj.consumers or {}
+    local upstreams = obj.upstreams or {}
+
+    -- 🧹 Clear previous configuration
+    clear_existing_config()
+
+    -- Import each section
+    local import_counts = {
+        routes = 0,
+        services = 0,
+        consumers = 0,
+        upstreams = 0
+    }
+
+    local function import_list(resource_name, list)
+        local resource = resources[resource_name]
+        if not resource then
+            core.log.warn("Resource not found: ", resource_name)
+            return
+        end
+
+        for _, item in ipairs(list) do
+            if item.id then
+                local code, data = resource.put(resource, item.id, item, nil, {})
+                if code == 200 or code == 201 then
+                    import_counts[resource_name] = import_counts[resource_name] + 1
+                else
+                    core.log.warn("Failed to import ", resource_name, " id=", item.id, " code=", code)
+                end
+            else
+                core.log.warn("Skipping ", resource_name, " without id: ", core.json.encode(item))
+            end
+        end
+    end
+
+    import_list("routes", routes)
+    import_list("services", services)
+    import_list("consumers", consumers)
+    import_list("upstreams", upstreams)
+
+-- 🧠 Helper for pluralization
+    local function pluralize(count, singular, plural)
+        if count <= 1 then
+            return string.format("%d %s", count, singular)
+        else
+            return string.format("%d %s", count, plural)
+        end
+    end
+
+    save_last_import_time()
+
+    local summary_msg = string.format(
+        "✅ Import completed successfully: %s, %s, %s, %s imported.",
+        pluralize(import_counts.routes, "Route", "Routes"),
+        pluralize(import_counts.services, "Service", "Services"),
+        pluralize(import_counts.consumers, "Consumer", "Consumers"),
+        pluralize(import_counts.upstreams, "Upstream", "Upstreams")
+    )
+
+    -- Return JSON response with summary
+    core.response.exit(200, {
+        message = summary_msg,
+        imported = import_counts,
+        last_import = get_last_import_time()
+    })
+end
+
+local function run_export()
+    set_ctx_and_check_token()
+
+    -- List of resources to export
+    local resource_list = { "routes", "services", "upstreams", "consumers" }
+    local export_data = {}
+
+    for _, seg_res in ipairs(resource_list) do
+        local data, err = get_resource_data(seg_res)
+        if not data then
+            core.log.error("Failed to fetch resource: ", seg_res, " err: ", err)
+        else
+            -- Decode JSON into Lua table
+            local json_str = core.json.encode(data, true)
+            local obj, decode_err = cjson.decode(json_str)
+            if not obj then
+                core.log.error("Failed to decode JSON for ", seg_res, ": ", decode_err)
+            else
+                -- Extract .list[*].value entries
+                local values = {}
+                if obj.list then
+                    for _, item in ipairs(obj.list) do
+                        if item.value then
+                            table.insert(values, item.value)
+                        end
+                    end
+                end
+                export_data[seg_res] = values
+            end
+        end
+    end
+
+    -- Convert to YAML (clean)
+    local yaml_str = to_yaml_clean(export_data)
+
+    ngx.status = 200
+    ngx.header["Content-Type"] = "application/yaml"
+    ngx.say(yaml_str)
+    return ngx.exit(200)
+end
 
 local function run()
-    core.log.info("INIT RUN Method ", get_method(), " URI ", ngx.var.uri)
     set_ctx_and_check_token()
 
     local uri_segs = core.utils.split_uri(ngx.var.uri)
-    core.log.info("uri: ", core.json.delay_encode(uri_segs))
 
     -- /apisix/admin/schema/route
     local seg_res, seg_id = uri_segs[4], uri_segs[5]
@@ -235,6 +503,8 @@ local function run()
     else
         code, data = resource[method](resource, seg_id, req_body, seg_sub_path, uri_args)
     end
+    
+     local json_str = core.json.encode(data, true)  -- 'true' = pretty print
 
     if code then
         if method == "get" and plugin.enable_data_encryption then
@@ -386,7 +656,6 @@ end
 
 local function schema_validate()
     local uri_segs = core.utils.split_uri(ngx.var.uri)
-    core.log.info("uri: ", core.json.delay_encode(uri_segs))
 
     local seg_res = uri_segs[6]
     local resource = resources[seg_res]
@@ -460,13 +729,22 @@ local uri_route = {
         methods = { "GET", "POST", "DELETE", "PATCH" },
         handler = unsupported_methods_reload_plugin,
     },
-     {
+    {
         paths = [[/apisix/admin/export]],
         methods = {"GET"},
-        handler = resources.export.export_yaml_handler,
-     }
+        handler = run_export,
+    },
+    {
+        paths = [[/apisix/admin/import]],
+        methods = {"POST"},
+        handler = run_import,
+    },
+    {
+        paths = "/apisix/admin/import/last",
+        methods = {"GET"},
+        handler = get_last_import_handler,
+    }
 }
-
 
 local standalone_uri_route = {
     http_head_route,
@@ -476,7 +754,6 @@ local standalone_uri_route = {
         handler = standalone_run,
     },
 }
-
 
 function _M.init_worker()
     local local_conf = core.config.local_conf()

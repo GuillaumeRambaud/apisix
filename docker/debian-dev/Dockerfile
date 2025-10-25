@@ -51,6 +51,17 @@ RUN apt-get -y update --fix-missing \
     && apt-get remove --purge --auto-remove -y \
     && mkdir -p /usr/local/apisix/ui
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libsodium-dev \
+        build-essential \
+        luarocks && \
+    luarocks install luasodium && \
+    luarocks install bcrypt && \
+    # Clean up: remove build tools and apt cache to reduce image size
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /usr/local/apisix /usr/local/apisix
 COPY --from=build /usr/local/openresty /usr/local/openresty
 COPY --from=build /usr/bin/apisix /usr/bin/apisix

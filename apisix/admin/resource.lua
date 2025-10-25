@@ -109,13 +109,13 @@ function _M:check_conf(id, conf, need_id, typ, allow_time)
     end
 
     -- check create time and update time
-    if not allow_time then
-        local forbidden_properties = {"create_time", "update_time"}
-        local err = check_forbidden_properties(conf, forbidden_properties)
-        if err then
-            return nil, {error_msg = err}
-        end
-    end
+    -- if not allow_time then
+    --     local forbidden_properties = {"create_time", "update_time"}
+    --     local err = check_forbidden_properties(conf, forbidden_properties)
+    --     if err then
+    --         return nil, {error_msg = err}
+    --     end
+    -- end
 
     -- check the resource own rules
     if self.name ~= "secrets" then
